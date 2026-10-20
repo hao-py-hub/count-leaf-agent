@@ -1,7 +1,24 @@
 # CV Agent 项目现状总结
 
-> 最后更新：2026-04-29
+> 最后更新：2026-08-30
 > 目的：记录项目完整架构、各模块职责、历史改动、已知问题，以便快速恢复开发上下文。
+
+> **状态说明：** 以下早期章节保留为原 CV 流水线背景。当前项目已升级为单用户本地的“CV 计数 + 受控多 Agent”系统：FastAPI v2 API、LangGraph 固定路由、异步单图/批量任务、SQLite 持久化、人工复核版本链、审计、Function Calling、本地 MCP，以及 SQLite FTS5 RAG 均已实现。RAG 当前为 `keyword`/`hybrid` 本地检索，不使用 Qdrant 或 Embedding；OIDC/RBAC、多租户、对象存储和生产级 Redis/Celery 属于后续企业化。
+
+## PRD/TDD v0.3 验收状态
+
+| 范围 | 当前状态 | 关键实现 |
+|---|---|---|
+| 异步分析与幂等 | 已完成 | 单图/批量任务、持久化、`retry_of`、缓存撤销 |
+| 缓存与版本链 | 已完成 | 图像/模型/提示词/果柄过滤阈值版本缓存；人工修订不覆盖自动版本 |
+| 人工复核 | 已完成 | 自动原因码、`review_required`、`resolved`/`dismissed`、批次终态聚合 |
+| 受控 Agent/Skill | 已完成 | LangGraph 固定路由、ToolPolicy、显式写操作确认 |
+| Function Calling/MCP | 已完成 | 版本化 Schema、本地 `stdio` 六项只读工具、越权审计；所有项目范围读取均透传并校验 `project_id` |
+| RAG 与会话摘要 | 已完成 | SQLite FTS5、版本化检索缓存、会话脱敏摘要与运行 ID 引用 |
+| 成本与可观测性 | 已完成 | trace 账本、主识别/裁剪复核/角果复核逐调用 token 与估算成本、含未确认写操作率的指标 API |
+| v0.4 策略治理基础 | 第四十一阶段完成 | 会话、trace 回放、知识库、历史、审计、运营指标、外部只读工具、批次列表、历史导出和兼容接口均按 `project_id` 隔离；上传资产、正式/Agent 任务、复核、批次和报告读取会隐藏不属于当前项目的资源，所有主要入口统一规范化项目标识，跨项目写操作在调用业务服务前被拒绝，报告任务状态可跨重启恢复 |
+
+验收证据：2026-08-30 本地 `unittest` 全量回归已通过 296 项；会话、trace 回放、兼容接口、证据包，以及上传、标准/Agent 任务、批量任务、人工复核、报告、知识库和历史导出的项目标识规范化与项目隔离专项均通过。离线 Agent 黄金集 9/9 通过，路由准确率、工具选择准确率和需引用用例的引用覆盖率均为 100%（范围仅为 9 条离线受控 Agent 用例，不代表图像计数准确率）；实际 MCP `stdio` 子进程握手返回协议 `2024-11-05`，且工具清单恰为 6 个只读工具；领域事件 API 已验证项目/trace 筛选、非法 limit 拒绝和审计对账，并覆盖报告完成与复核结案投影；单图、批次 REST、Agent 批量工作流及前端任务中心已验证 `project_id` 透传/筛选及错误项目 404；正式任务的重试、取消和缓存撤销已验证错误项目在触发写服务前返回 404；资产登记持久化失败时会清理上传文件；`docker compose config --quiet` 通过。当前范围仍是单机单用户 MVP；OIDC/RBAC、多租户、对象存储、远程 MCP 网关和生产级 Redis/Celery 运维不在本期范围。
 
 ---
 
@@ -162,8 +179,8 @@ cv-agent/
 | `vlm_label_plants()` | 发送整图给 VLM，识别各部件 bbox（0-1000 归一化坐标）→ 转像素 bbox → 裁剪 |
 | `vlm_verify_crop()` | 发送原图+裁剪图，判断 keep/delete/recrop |
 | `apply_recrop()` | 根据 VLM 返回的新 bbox 重新裁剪 |
-| `vlm_detect_adhesion()` | 异株粘连检测（**当前已禁用**，注释掉了） |
-| `mask_adhesion_regions()` | 粘连区域遮涂（**当前已禁用**） |
+| `vlm_detect_adhesion()` | 异株粘连检测（`ENABLE_VLM_ADHESION_DETECTION=true` 时启用） |
+| `mask_adhesion_regions()` | 粘连区域遮涂（启用检测后写入缓存前执行） |
 
 **VLM 配置**：
 - 模型：`VLM_MODEL`（env 配置，当前为豆包 Vision endpoint）
@@ -293,25 +310,23 @@ bacc486        feat: 直尺检测(平滑列密度扫描) + VLM提示词优化 + 
 
 ### P0 — 角果尖端粘连
 
-两个角果尖端在骨架上合并 → tip 消失 → 漏数。果柄法（stalk）部分缓解此问题，但仍非完美。
+两个角果尖端在骨架上合并 → tip 消失 → 漏数。果柄法（stalk）部分缓解此问题，但仍非完美。已接入 DeepCanola BR017 离线评测工具：外部验证集中 410 张图有 408 张可与逐角果 CSV 真值匹配；评测脚本会输出 MAE、RMSE、偏差、漏/过计率和覆盖率。BR017 图像是黑底独立角果，不含当前流水线所需的主干/主枝/分枝，不能用于整株果柄法准确率评测；试运行器遇到此结构性错误会立即停止，避免继续调用 VLM。当前没有可宣称的整株算法准确率结论；BR11 的无序粘连样本仍需要逐图总数真值才能做严格 P0 定量评测。
 
-### P1 — VLM 标注无程序级校验
+### P1 — VLM 标注已增加程序级校验
 
-- VLM 返回的 bbox/标签完全信任，无合理性检查
-- 可能漏标、错标、bbox 偏移
-- 没有多主干检测、bbox 重叠检测
+主标注结果仅接受 `主干`、`主枝`、`分枝` 标签和有限、非空的归一化 bbox；越界坐标会裁剪到 `[0, 1000]`，非法标签、重复/非法 ID 和空框会在裁剪前拒绝。多个主干保留面积最大的一个并记录警告；IoU ≥ 0.85 的疑似重复框会写入调试留痕，并以 `model_conflict` 自动进入复核，不会静默删除可能真实相邻的部件。该校验能阻断结构性错误，但不能替代带标注数据对漏标或偏移的准确性评测。
 
-### P2 — 异株粘连检测已禁用
+### P2 — 异株粘连检测默认关闭
 
-`analyzer.py` 中 `vlm_detect_adhesion` 调用被注释掉（暂时测试 tight crop 效果），但代码仍保留在 `vlm_counter.py` 中。
+`ENABLE_VLM_ADHESION_DETECTION=false` 是默认值，避免每个裁剪图增加额外 VLM 成本；需要处理复杂粘连样本时可显式启用，启用后的遮涂结果会在缓存前生效。
 
-### P3 — 批量测试无法即时取消
+### P3 — 批量取消采用安全的队列语义
 
-VLM 调用在 ThreadPoolExecutor 中运行时，`_batch_cancel` 信号无法中断正在执行的 future，需要等当前并行批次全部完成才能停止。
+旧版 `/api/batch_test` 的 ThreadPoolExecutor 取消信号已不再是当前接口。现行 `/api/v2/batches/{batch_id}/cancel` 只取消仍处于 `queued` 的子任务，运行中的 VLM/CV 调用完成当前分析以避免半写入结果；响应和审计同时记录 `cancelled_count`、`running_count`，客户端可继续通过 SSE 观察其终态。
 
-### P4 — 枯枝过滤参数硬编码
+### P4 — 枯枝过滤参数已可配置
 
-`WIDTH_RATIO=0.70`, `AREA_RATIO=0.25` 等是经验值，不同品种/拍照条件可能需要不同阈值。
+`STALK_TWIG_WIDTH_RATIO=0.70`、`STALK_TWIG_AREA_RATIO=0.25` 分别控制果柄法第一阶段相对分支宽度、面积中位数的过滤边界；两者限制为 `(0, 1]`，默认值保持既有行为。它们进入异步任务缓存键，因此调参后的新任务不会复用旧结果。不同品种/拍照条件的最优值仍需以带标注数据评测后确定。
 
 ---
 
@@ -336,6 +351,8 @@ curl -X POST http://localhost:8501/api/batch_stop
 ARK_API_KEY=xxx           # 豆包 API Key
 ARK_API_BASE=https://ark.cn-beijing.volces.com/api/v3
 VLM_MODEL=ep-2026042...   # 豆包 Vision 模型 endpoint
+STALK_TWIG_WIDTH_RATIO=0.70 # 果柄法枯枝宽度过滤比例，范围 (0, 1]
+STALK_TWIG_AREA_RATIO=0.25  # 果柄法枯枝面积过滤比例，范围 (0, 1]
 HOST=0.0.0.0
 PORT=8501
 ```
@@ -344,7 +361,7 @@ PORT=8501
 
 ## 十三、精度概况
 
-### 早期精度（21 张缓存样本，CV-only）
+### 历史观察值（21 张缓存样本，CV-only；非正式评测）
 
 | 指标 | 骨架方案 | 图论方案 |
 |---|---|---|
@@ -354,7 +371,7 @@ PORT=8501
 
 ### 果柄方案（stalk）
 
-正在进行批量测试验证中，预期解决 tip-merging 漏数问题后有提升。
+尚无与固定整株真值集对应的可复现正式评测，不能将上表外推为当前系统准确率。后续需要使用与整株拍摄结构匹配、逐图有真值的数据集单独报告结果。
 
 ---
 
@@ -366,7 +383,7 @@ main.py
       ├── vlm_counter.py
       │    ├── vlm_label_plants()      — 部件识别
       │    ├── vlm_verify_crop()       — 裁剪验证
-      │    └── vlm_detect_adhesion()   — 粘连检测（已禁用）
+      │    └── vlm_detect_adhesion()   — 粘连检测（可选开关）
       ├── pod_counter.py               — 骨架法（+ 共用工具函数）
       │    ├── _binarize()
       │    ├── _get_skeleton()

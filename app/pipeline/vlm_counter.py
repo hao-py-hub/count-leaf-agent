@@ -11,6 +11,7 @@ Grid-based approach:
 import base64
 import io
 import json
+import math
 import re
 
 import cv2
@@ -410,6 +411,9 @@ def vlm_detect_adhesion(crop_bgr: np.ndarray, plant_id: int = 0,
     if spatial_ctx:
         print(f"[VLM Adhesion] Spatial context:\n{spatial_ctx[:300]}")
     raw_response = ""
+    input_tokens = None
+    output_tokens = None
+    error_code = None
     try:
         response = client.chat.completions.create(
             model=VLM_MODEL,
@@ -433,11 +437,14 @@ def vlm_detect_adhesion(crop_bgr: np.ndarray, plant_id: int = 0,
         raw_response = response.choices[0].message.content.strip()
         usage = getattr(response, 'usage', None)
         if usage:
+            input_tokens = getattr(usage, 'prompt_tokens', None)
+            output_tokens = getattr(usage, 'completion_tokens', None)
             print(f"[VLM Adhesion] Tokens: prompt={usage.prompt_tokens}, "
                   f"completion={usage.completion_tokens}")
         print(f"[VLM Adhesion] Response ({len(raw_response)} chars):\n{raw_response[:500]}")
     except Exception as e:
         raw_response = f"Doubao API error: {e}"
+        error_code = "api_error"
         print(f"[VLM Adhesion] {raw_response}")
 
     parsed = _parse_json(raw_response)
@@ -452,7 +459,8 @@ def vlm_detect_adhesion(crop_bgr: np.ndarray, plant_id: int = 0,
             pass
 
     if not parsed or not isinstance(parsed, dict):
-        return {"has_foreign": False, "regions": [], "raw_response": raw_response}
+        return {"has_foreign": False, "regions": [], "raw_response": raw_response,
+                "model_call": {"source": "adhesion", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": error_code or "parse_error"}}
 
     has_foreign = parsed.get("has_foreign", False)
     raw_regions = parsed.get("regions", [])
@@ -477,6 +485,7 @@ def vlm_detect_adhesion(crop_bgr: np.ndarray, plant_id: int = 0,
         "has_foreign": has_foreign,
         "regions": valid_regions,
         "raw_response": raw_response,
+        "model_call": {"source": "adhesion", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": error_code},
     }
 
 
@@ -518,6 +527,68 @@ def mask_adhesion_regions(crop_bgr: np.ndarray, regions: list) -> tuple:
 
     print(f"[Mask Adhesion] Filled {len(regions)} polygon regions with black")
     return masked, debug
+
+
+def validate_plant_detections(plants: list) -> tuple[list[dict], dict]:
+    """Keep only safe, canonical VLM component detections before cropping."""
+    allowed_labels = {"主干", "主枝", "分枝"}
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+    seen_ids: set[int] = set()
+
+    for index, candidate in enumerate(plants, start=1):
+        if not isinstance(candidate, dict):
+            rejected.append({"index": index, "reason": "not_object"})
+            continue
+        label = candidate.get("label")
+        bbox = candidate.get("bbox")
+        if label not in allowed_labels:
+            rejected.append({"index": index, "reason": "invalid_label", "label": label})
+            continue
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            rejected.append({"index": index, "reason": "invalid_bbox_shape"})
+            continue
+        try:
+            normalized_bbox = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            rejected.append({"index": index, "reason": "non_numeric_bbox"})
+            continue
+        if not all(math.isfinite(value) for value in normalized_bbox):
+            rejected.append({"index": index, "reason": "non_finite_bbox"})
+            continue
+        x1, y1, x2, y2 = [min(1000.0, max(0.0, value)) for value in normalized_bbox]
+        if x2 <= x1 or y2 <= y1:
+            rejected.append({"index": index, "reason": "empty_bbox"})
+            continue
+        try:
+            plant_id = int(candidate.get("id", index))
+        except (TypeError, ValueError):
+            rejected.append({"index": index, "reason": "invalid_id"})
+            continue
+        if plant_id < 1 or plant_id in seen_ids:
+            rejected.append({"index": index, "reason": "duplicate_or_invalid_id", "id": candidate.get("id")})
+            continue
+        seen_ids.add(plant_id)
+        accepted.append({**candidate, "id": plant_id, "label": label, "bbox": [x1, y1, x2, y2]})
+
+    trunks = [plant for plant in accepted if plant["label"] == "主干"]
+    warnings: list[dict] = []
+    if len(trunks) > 1:
+        primary_trunk = max(trunks, key=lambda plant: (plant["bbox"][2] - plant["bbox"][0]) * (plant["bbox"][3] - plant["bbox"][1]))
+        accepted = [plant for plant in accepted if plant["label"] != "主干" or plant is primary_trunk]
+        warnings.append({"reason": "multiple_trunks", "kept_id": primary_trunk["id"], "discarded_ids": [plant["id"] for plant in trunks if plant is not primary_trunk]})
+
+    for left_index, left in enumerate(accepted):
+        lx1, ly1, lx2, ly2 = left["bbox"]
+        left_area = (lx2 - lx1) * (ly2 - ly1)
+        for right in accepted[left_index + 1:]:
+            rx1, ry1, rx2, ry2 = right["bbox"]
+            intersection = max(0.0, min(lx2, rx2) - max(lx1, rx1)) * max(0.0, min(ly2, ry2) - max(ly1, ry1))
+            union = left_area + (rx2 - rx1) * (ry2 - ry1) - intersection
+            if union and intersection / union >= 0.85:
+                warnings.append({"reason": "near_duplicate_overlap", "plant_ids": [left["id"], right["id"]]})
+
+    return accepted, {"accepted_count": len(accepted), "rejected": rejected, "warnings": warnings}
 
 
 def vlm_label_plants(image: np.ndarray) -> dict:
@@ -617,6 +688,9 @@ def vlm_label_plants(image: np.ndarray) -> dict:
 
     print(f"[VLM] Original {w}x{h}, using 0-1000 normalized coords...")
     raw_response = ""
+    input_tokens = None
+    output_tokens = None
+    error_code = None
     try:
         response = client.chat.completions.create(
             model=VLM_MODEL,
@@ -640,11 +714,31 @@ def vlm_label_plants(image: np.ndarray) -> dict:
         raw_response = response.choices[0].message.content.strip()
         usage = getattr(response, 'usage', None)
         if usage:
+            input_tokens = getattr(usage, 'prompt_tokens', None)
+            output_tokens = getattr(usage, 'completion_tokens', None)
             print(f"[VLM] Tokens: prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}")
         print(f"[VLM] Response ({len(raw_response)} chars):\n{raw_response[:800]}")
     except Exception as e:
         raw_response = f"Doubao API error: {e}"
+        error_code = "api_error"
+        trace.event(
+            "vlm_annotate_failed", phase="annotate", error_type=type(e).__name__,
+            error_message=str(e)[:500], http_status=getattr(e, "status_code", None),
+        )
         print(f"[VLM] {raw_response}")
+
+        # API 错误文本可能含方括号数字，不能交给 JSON 容错解析器，避免把
+        # 错误码误当作植株数组并在后续 p.get(...) 处崩溃。
+        return {
+            "labeled_image": image.copy(), "crops": {}, "plants": [],
+            "raw_response": raw_response, "parse_error": True,
+            "partial_json": False, "validation": {"accepted_count": 0, "rejected": [], "warnings": []},
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "model_call": {
+                "source": "label", "input_tokens": input_tokens,
+                "output_tokens": output_tokens, "error_code": error_code,
+            },
+        }
 
     # Parse
     parsed = _parse_json(raw_response)
@@ -663,7 +757,10 @@ def vlm_label_plants(image: np.ndarray) -> dict:
         plants = None
 
     partial_json = bool(parsed and _extract_json_array(raw_response) is None)
-    if not plants or not isinstance(plants, list):
+    validation = {"accepted_count": 0, "rejected": [], "warnings": []}
+    if isinstance(plants, list):
+        plants, validation = validate_plant_detections(plants)
+    if not plants:
         return {
             "labeled_image": image.copy(),
             "crops": {},
@@ -671,6 +768,10 @@ def vlm_label_plants(image: np.ndarray) -> dict:
             "raw_response": raw_response,
             "parse_error": True,
             "partial_json": False,
+            "validation": validation,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+                "model_call": {"source": "label", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": error_code or "parse_error"},
         }
 
     # Normalize ruler / label_tag
@@ -773,6 +874,10 @@ def vlm_label_plants(image: np.ndarray) -> dict:
         "ruler": ruler,
         "label_tag": label_tag,
         "sample_id": sample_id,
+        "validation": validation,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "model_call": {"source": "label", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": error_code},
     }
 
 
@@ -880,6 +985,8 @@ def vlm_verify_crop(original_image: np.ndarray,
 
     print(f"[VLM Verify] Checking #{pid} {label}...")
     raw = ""
+    input_tokens = None
+    output_tokens = None
     try:
         response = client.chat.completions.create(
             model=VLM_MODEL,
@@ -899,17 +1006,23 @@ def vlm_verify_crop(original_image: np.ndarray,
             temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
+        usage = getattr(response, "usage", None)
+        if usage:
+            input_tokens = getattr(usage, "prompt_tokens", None)
+            output_tokens = getattr(usage, "completion_tokens", None)
         print(f"[VLM Verify] #{pid} response: {raw[:300]}")
     except Exception as e:
         print(f"[VLM Verify] #{pid} error: {e}")
-        return {"action": "keep", "reason": f"verify failed: {e}"}
+        return {"action": "keep", "reason": f"verify failed: {e}",
+                "model_call": {"source": "crop_verify", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": "api_error"}}
 
     # Parse — _parse_json returns either a list or dict
     parsed = _parse_json(raw)
     if isinstance(parsed, list) and parsed:
         parsed = parsed[0]
     if not isinstance(parsed, dict):
-        return {"action": "keep", "reason": "parse failed, default keep"}
+        return {"action": "keep", "reason": "parse failed, default keep",
+                "model_call": {"source": "crop_verify", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": "parse_error"}}
 
     action = parsed.get("action", "keep")
     if action not in ("keep", "delete", "recrop"):
@@ -925,6 +1038,7 @@ def vlm_verify_crop(original_image: np.ndarray,
             print(f"[VLM Verify] #{pid} recrop missing valid new_bbox, falling back to keep")
             result["action"] = "keep"
             result["reason"] = "recrop requested but new_bbox invalid"
+    result["model_call"] = {"source": "crop_verify", "input_tokens": input_tokens, "output_tokens": output_tokens}
     return result
 
 

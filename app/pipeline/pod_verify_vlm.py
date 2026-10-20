@@ -328,7 +328,7 @@ def verify_pod_markers(
             "verified_image": debug_image.copy(),
         }
 
-    client = _get_client()
+    client = _get_client(phase="pod_review")
 
     # Convert normalized coords to pixel space of the crop image
     h_crop, w_crop = crop_bgr.shape[:2]
@@ -457,6 +457,8 @@ def verify_pod_markers(
           f"{len(filtered_markers)} filtered) for verification...")
 
     raw = ""
+    input_tokens = None
+    output_tokens = None
     try:
         message_content = [
             {"type": "text", "text": prompt},
@@ -496,6 +498,8 @@ def verify_pod_markers(
         raw = response.choices[0].message.content.strip()
         usage = getattr(response, 'usage', None)
         if usage:
+            input_tokens = getattr(usage, "prompt_tokens", None)
+            output_tokens = getattr(usage, "completion_tokens", None)
             print(f"[VLM PodVerify] Tokens: prompt={usage.prompt_tokens}, "
                   f"completion={usage.completion_tokens}")
         print(f"[VLM PodVerify] Response: {raw[:400]}")
@@ -510,6 +514,7 @@ def verify_pod_markers(
             "adjusted_pod_count": pod_count,
             "reason": f"VLM 调用失败: {e}",
             "verified_image": debug_image.copy(),
+            "model_call": {"source": "pod_verify", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": "api_error"},
         }
 
     # Parse response
@@ -527,6 +532,7 @@ def verify_pod_markers(
             "adjusted_pod_count": pod_count,
             "reason": "VLM 返回解析失败，保持原计数",
             "verified_image": debug_image.copy(),
+            "model_call": {"source": "pod_verify", "input_tokens": input_tokens, "output_tokens": output_tokens, "error_code": "parse_error"},
         }
 
     # 支持多种格式：
@@ -635,6 +641,7 @@ def verify_pod_markers(
         "adjusted_pod_count": adjusted,
         "reason": reason,
         "verified_image": verified_img,
+        "model_call": {"source": "pod_verify", "input_tokens": input_tokens, "output_tokens": output_tokens},
     }
 
 

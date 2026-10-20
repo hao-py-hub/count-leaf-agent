@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "count-beaf-agent": {
+      "command": "C:\\Users\\YOUR_USER\\Desktop\\count-beaf-agent\\.venv312\\Scripts\\python.exe",
+      "args": ["-m", "app.mcp.server"],
+      "cwd": "C:\\Users\\YOUR_USER\\Desktop\\count-beaf-agent"
+    }
+  }
+}

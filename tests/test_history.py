@@ -96,6 +96,41 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(restored["total_pods"], 16)
         self.assertFalse(self.store.get("sample-run")["is_modified"])
 
+    def test_manual_payload_cannot_override_provenance(self):
+        self.store.start("provenance-run", "sample.jpg", "uploads/sample.jpg")
+        self.store.complete(
+            "provenance-run",
+            {**_sample_result(), "provenance": {"algorithm": "stalk", "algorithm_version": "stalk-v0.1", "vlm_model": "model-a", "executor_mode": "in_process"}},
+            [],
+        )
+        updated = self.store.update(
+            "provenance-run",
+            {
+                "plant_count": 3,
+                "plants": [
+                    {"id": 1, "label": "主干", "pod_count": 2},
+                    {"id": 2, "label": "主枝", "pod_count": 11},
+                    {"id": 3, "label": "分枝", "pod_count": 6},
+                ],
+                "provenance": {"algorithm": "forged", "vlm_model": "forged"},
+            },
+        )
+        self.assertEqual(updated["provenance"]["algorithm"], "stalk")
+        self.assertEqual(updated["provenance"]["vlm_model"], "model-a")
+        self.assertEqual(self.store.restore("provenance-run")["provenance"]["algorithm_version"], "stalk-v0.1")
+
+    def test_project_scoped_history_hides_other_project_records(self):
+        self.store.start("project-a-run", "a.jpg", "uploads/a.jpg", project_id="project-a")
+        self.store.complete("project-a-run", _sample_result(), [])
+        self.store.start("project-b-run", "b.jpg", "uploads/b.jpg", project_id="project-b")
+        self.store.complete("project-b-run", _sample_result(), [])
+
+        project_a = self.store.list(project_id="project-a")
+        self.assertEqual(project_a["count"], 1)
+        self.assertEqual(project_a["items"][0]["run_id"], "project-a-run")
+        self.assertIsNone(self.store.get("project-b-run", project_id="project-a"))
+        self.assertEqual(self.store.summarize(project_id="project-b")["reference_ids"], ["project-b-run"])
+
 
 if __name__ == "__main__":
     unittest.main()

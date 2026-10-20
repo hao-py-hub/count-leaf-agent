@@ -14,9 +14,24 @@ numba>=0.59.0
 
 # VLM (GPT-4o)
 openai>=1.30.0
+httpx[socks]>=0.23.0,<1
+
+# Agent orchestration
+langchain-core>=0.3.0,<0.4.0
+langgraph>=0.2.0,<0.4.0
+
+# Enterprise Agent interoperability (implemented with MCP stdio JSON-RPC)
+# No external MCP runtime is required for the bounded local adapter.
+
+# Enterprise persistence and asynchronous tasks
+SQLAlchemy>=2.0.0,<2.1.0
+psycopg[binary]>=3.2.0,<3.3.0
+celery>=5.4.0,<5.5.0
+redis>=5.0.0,<6.0.0
 
 # Image utilities
 Pillow>=10.0.0
 
 # Results export
 pandas>=2.0.0
+openpyxl>=3.1,<4

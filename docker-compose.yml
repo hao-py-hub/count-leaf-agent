@@ -13,6 +13,11 @@ services:
       VLM_MODEL: ${VLM_MODEL:-ep-20260420011113-6jvmx}
       VLM_FP_CONFIDENCE_THRESHOLD: ${VLM_FP_CONFIDENCE_THRESHOLD:-0.8}
       DATA_DIR: /app/data
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./data/agent.sqlite3}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_TASK_BROKER_URL: ${CELERY_TASK_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      JOB_EXECUTOR_MODE: ${JOB_EXECUTOR_MODE:-in_process}
     ports:
       - "8501:8501"
     volumes:
@@ -32,3 +37,52 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["enterprise"]
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  cv-agent-worker:
+    image: cv-agent:latest
+    profiles: ["enterprise"]
+    environment:
+      DATA_DIR: /app/data
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./data/agent.sqlite3}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_TASK_BROKER_URL: ${CELERY_TASK_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      JOB_EXECUTOR_MODE: celery
+      ARK_API_KEY: ${ARK_API_KEY:-}
+      ARK_API_BASE: ${ARK_API_BASE:-https://ark.cn-beijing.volces.com/api/v3}
+      VLM_MODEL: ${VLM_MODEL:-ep-20260420011113-6jvmx}
+      VLM_FP_CONFIDENCE_THRESHOLD: ${VLM_FP_CONFIDENCE_THRESHOLD:-0.8}
+    command: celery -A app.infrastructure.tasks.celery_app:celery_app worker --loglevel=INFO
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./online_uploads:/app/online_uploads
+      - ./benchmark_cache:/app/benchmark_cache
+      - ./data:/app/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["enterprise"]
+    environment:
+      POSTGRES_DB: phenotype_agent
+      POSTGRES_USER: phenotype
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-phenotype}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:

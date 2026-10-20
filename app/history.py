@@ -1,4 +1,4 @@
-"""SQLite-backed history storage and manual result revision helpers."""
+"""基于 SQLite 的历史存储与人工结果修订工具。"""
 
 from __future__ import annotations
 
@@ -12,10 +12,25 @@ from typing import Any
 
 
 ALLOWED_LABELS = {"主干", "主枝", "分枝"}
+PRIVATE_RESULT_FIELDS = frozenset({"source_image", "result_dir"})
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def public_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Return an API-safe result view without local filesystem locations."""
+    return {key: copy.deepcopy(value) for key, value in result.items() if key not in PRIVATE_RESULT_FIELDS}
+
+
+def public_history_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return history detail without stored local paths or result path metadata."""
+    visible = {key: copy.deepcopy(value) for key, value in record.items() if key != "source_path"}
+    for field_name in ("result", "original_result"):
+        if isinstance(visible.get(field_name), dict):
+            visible[field_name] = public_result(visible[field_name])
+    return visible
 
 
 def _as_non_negative_int(value: Any, field: str) -> int:
@@ -192,11 +207,19 @@ class HistoryStore:
                     original_result_json TEXT,
                     current_result_json TEXT,
                     steps_json TEXT NOT NULL DEFAULT '[]',
-                    revision INTEGER NOT NULL DEFAULT 0
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    project_id TEXT NOT NULL DEFAULT 'default'
                 );
                 CREATE INDEX IF NOT EXISTS idx_analysis_history_created_at
                 ON analysis_history(created_at DESC);
                 """
+            )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(analysis_history)")}
+            if "project_id" not in columns:
+                connection.execute("ALTER TABLE analysis_history ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_analysis_history_project_created_at "
+                "ON analysis_history(project_id, created_at DESC)"
             )
 
     def start(
@@ -205,24 +228,26 @@ class HistoryStore:
         source_label: str,
         source_path: str,
         source_kind: str = "upload",
+        project_id: str = "default",
     ) -> None:
         now = _now_iso()
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO analysis_history (
-                    run_id, source_label, source_path, source_kind,
+                    run_id, source_label, source_path, source_kind, project_id,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'processing', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'processing', ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     source_label=excluded.source_label,
                     source_path=excluded.source_path,
                     source_kind=excluded.source_kind,
+                    project_id=excluded.project_id,
                     status='processing',
                     updated_at=excluded.updated_at,
                     error_message=NULL
                 """,
-                (run_id, source_label, source_path, source_kind, now, now),
+                (run_id, source_label, source_path, source_kind, project_id, now, now),
             )
 
     def complete(
@@ -268,26 +293,43 @@ class HistoryStore:
                 (message, now, steps_json, run_id),
             )
 
-    def get(self, run_id: str) -> dict[str, Any] | None:
+    def get(self, run_id: str, project_id: str = "default") -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM analysis_history WHERE run_id=?",
-                (run_id,),
+                "SELECT * FROM analysis_history WHERE run_id=? AND project_id=?",
+                (run_id, project_id),
             ).fetchone()
         return self._row_to_detail(row) if row else None
+
+    def fail_stale_processing(
+        self,
+        message: str = "分析中断（连接终止或服务重启）",
+    ) -> int:
+        """启动时收敛遗留的 processing 记录，避免历史任务永久卡在进行中。"""
+        now = _now_iso()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE analysis_history SET status='failed', error_message=?, updated_at=?
+                WHERE status='processing'
+                """,
+                (message, now),
+            )
+            return cursor.rowcount
 
     def list(
         self,
         limit: int = 100,
         offset: int = 0,
         query: str = "",
+        project_id: str = "default",
     ) -> dict[str, Any]:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
-        where = ""
-        params: list[Any] = []
+        where = "WHERE project_id=?"
+        params: list[Any] = [project_id]
         if query.strip():
-            where = "WHERE source_label LIKE ?"
+            where += " AND source_label LIKE ?"
             params.append(f"%{query.strip()}%")
 
         with self._connection() as connection:
@@ -307,12 +349,49 @@ class HistoryStore:
             "items": [self._row_to_summary(row) for row in rows],
         }
 
-    def update(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def summarize(self, query: str = "", project_id: str = "default") -> dict[str, Any]:
+        """返回项目范围内、本地已存分析任务的受限明确摘要。"""
+        where = "WHERE project_id=?"
+        params: list[Any] = [project_id]
+        if query.strip():
+            where += " AND source_label LIKE ?"
+            params.append(f"%{query.strip()}%")
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT run_id, status, current_result_json FROM analysis_history {where}", params
+            ).fetchall()
+        completed = [row for row in rows if row["status"] == "completed" and row["current_result_json"]]
+        pod_counts = []
+        for row in completed:
+            result = json.loads(row["current_result_json"])
+            total_pods = (result.get("summary") or {}).get("total_pod_count", result.get("total_pods"))
+            if isinstance(total_pods, (int, float)):
+                pod_counts.append(total_pods)
+        return {
+            "scope_query": query.strip(),
+            "project_id": project_id,
+            "sample_count": len(rows),
+            "completed_count": len(completed),
+            "failed_count": sum(row["status"] == "failed" for row in rows),
+            "average_total_pods": round(sum(pod_counts) / len(pod_counts), 2) if pod_counts else None,
+            "reference_ids": [row["run_id"] for row in completed[:20]],
+        }
+
+    def summary_cache_version(self, project_id: str = "default") -> str:
+        """返回不暴露历史内容的轻量级项目缓存失效标记。"""
+        with self._connection() as connection:
+            count, latest_update = connection.execute(
+                "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM analysis_history WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+        return f"{count}:{latest_update}"
+
+    def update(self, run_id: str, payload: dict[str, Any], project_id: str = "default") -> dict[str, Any]:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT * FROM analysis_history WHERE run_id=?",
-                (run_id,),
+                "SELECT * FROM analysis_history WHERE run_id=? AND project_id=?",
+                (run_id, project_id),
             ).fetchone()
             if not row or not row["current_result_json"]:
                 raise KeyError(f"可编辑结果不存在：{run_id}")
@@ -325,23 +404,23 @@ class HistoryStore:
                 """
                 UPDATE analysis_history SET
                     current_result_json=?, revision=?, updated_at=?
-                WHERE run_id=?
+                WHERE run_id=? AND project_id=?
                 """,
                 (
                     json.dumps(updated, ensure_ascii=False, default=str),
                     revision,
                     now,
-                    run_id,
+                    run_id, project_id,
                 ),
             )
         return updated
 
-    def restore(self, run_id: str) -> dict[str, Any]:
+    def restore(self, run_id: str, project_id: str = "default") -> dict[str, Any]:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT * FROM analysis_history WHERE run_id=?",
-                (run_id,),
+                "SELECT * FROM analysis_history WHERE run_id=? AND project_id=?",
+                (run_id, project_id),
             ).fetchone()
             if not row or not row["original_result_json"]:
                 raise KeyError(f"原始结果不存在：{run_id}")
@@ -352,13 +431,13 @@ class HistoryStore:
                 """
                 UPDATE analysis_history SET
                     current_result_json=?, revision=?, updated_at=?
-                WHERE run_id=?
+                WHERE run_id=? AND project_id=?
                 """,
                 (
                     json.dumps(restored, ensure_ascii=False, default=str),
                     revision,
                     now,
-                    run_id,
+                    run_id, project_id,
                 ),
             )
         return restored
@@ -369,6 +448,7 @@ class HistoryStore:
         current_json = row["current_result_json"] or ""
         return {
             "run_id": row["run_id"],
+            "project_id": row["project_id"],
             "source_label": row["source_label"],
             "source_kind": row["source_kind"],
             "status": row["status"],
@@ -378,7 +458,7 @@ class HistoryStore:
             "error_message": row["error_message"],
             "revision": row["revision"],
             "is_modified": bool(original and current_json and original != current_json),
-            "thumbnail_url": f"/results/{row['run_id']}/step_01.png",
+            "thumbnail_url": f"/api/history/{row['run_id']}/thumbnail",
             "sample_id": current.get("sample_id", ""),
             "plant_count": current.get("plant_count"),
             "branch_count": current.get("branch_count"),

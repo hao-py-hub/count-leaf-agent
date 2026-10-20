@@ -1,0 +1,20 @@
+{
+  "dataset_name": "rapeseed-rag-evaluation-v0.1",
+  "dataset_version": "1.0",
+  "scope": "已归档的本机油菜考种知识资料",
+  "cases": [
+    {"id": "capture-001", "question": "拍摄油菜整株时背景布应该是什么颜色？", "expected_document_title": "油菜考种图像拍摄与上传规范", "expected_evidence_terms": ["纯黑色", "哑光背景布"], "category": "capture_sop", "expected_answerable": true},
+    {"id": "capture-002", "question": "标尺要怎么放才能用于株高测量？", "expected_document_title": "油菜考种图像拍摄与上传规范", "expected_evidence_terms": ["同一焦平面", "刻度清晰"], "category": "capture_sop", "expected_answerable": true},
+    {"id": "capture-003", "question": "出现哪些拍摄问题必须退回重拍？", "expected_document_title": "油菜考种图像拍摄与上传规范", "expected_evidence_terms": ["背景", "标尺", "光照"], "category": "capture_sop", "expected_answerable": true},
+    {"id": "metric-001", "question": "什么样的角果才算有效角果？", "expected_document_title": "油菜角果与分枝指标定义及测量标准", "expected_evidence_terms": ["饱满", "欠饱满", "种子"], "category": "metric_definition", "expected_answerable": true},
+    {"id": "metric-002", "question": "一次有效分枝怎么统计？", "expected_document_title": "油菜角果与分枝指标定义及测量标准", "expected_evidence_terms": ["主茎", "至少一个有效角果"], "category": "metric_definition", "expected_answerable": true},
+    {"id": "metric-003", "question": "角果长度是否包含果柄？", "expected_document_title": "油菜角果与分枝指标定义及测量标准", "expected_evidence_terms": ["不含果柄", "不含喙"], "category": "metric_definition", "expected_answerable": true},
+    {"id": "naming-001", "question": "同一植株的侧视图文件名应该怎样编号？", "expected_document_title": "样本命名与 Excel 真值表字段说明", "expected_evidence_terms": ["_2.jpg", "侧视图"], "category": "data_naming", "expected_answerable": true},
+    {"id": "naming-002", "question": "真值表缺失值应该怎么填？", "expected_document_title": "样本命名与 Excel 真值表字段说明", "expected_evidence_terms": ["NA", "不得留空"], "category": "data_naming", "expected_answerable": true},
+    {"id": "naming-003", "question": "人工复核后能直接覆盖原始真值表吗？", "expected_document_title": "样本命名与 Excel 真值表字段说明", "expected_evidence_terms": ["新版本", "禁止覆盖"], "category": "data_naming", "expected_answerable": true},
+    {"id": "review-001", "question": "哪些图片必须进行人工复核？", "expected_document_title": "人工复核标准与常见识别误差说明", "expected_evidence_terms": ["低置信度", "遮挡严重"], "category": "review", "expected_answerable": true},
+    {"id": "review-002", "question": "主枝角果数允许的相对误差是多少？", "expected_document_title": "人工复核标准与常见识别误差说明", "expected_evidence_terms": ["8%"], "category": "review", "expected_answerable": true},
+    {"id": "review-003", "question": "开裂角果可能造成什么识别错误？", "expected_document_title": "人工复核标准与常见识别误差说明", "expected_evidence_terms": ["多个片段", "重复计数"], "category": "review", "expected_answerable": true},
+    {"id": "out-of-scope-001", "question": "请根据知识库推荐下季度的施肥配方。", "expected_document_title": null, "expected_evidence_terms": [], "category": "out_of_scope", "expected_answerable": false}
+  ]
+}

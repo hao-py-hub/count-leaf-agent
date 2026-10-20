@@ -21,7 +21,8 @@ from .vlm_counter import (
 )
 from .pod_verify_vlm import verify_pod_markers
 from .pod_counter_stalk import count_pods_on_branch as _stalk_counter
-from app.config import RESULT_DIR, CACHE_DIR
+from app import cancel, trace
+from app.config import CACHE_DIR, ENABLE_VLM_ADHESION_DETECTION, RESULT_DIR
 
 
 def _safe_run_part(value: str, fallback: str = "image") -> str:
@@ -61,6 +62,7 @@ def analyze_plant_image_stream(
     """
     t0 = time.time()
     run_id = _safe_run_part(run_id) if run_id else _new_run_id(image_path)
+    trace.set_run(run_id)
     source_path = str(Path(image_path).resolve())
     source_label = source_label or Path(image_path).name
     if method != "stalk":
@@ -148,9 +150,25 @@ def analyze_plant_image_stream(
     # Step: Original
     yield _save_step(image, f"原始图片：{source_label}，{image.shape[1]}×{image.shape[0]} 像素")
 
+    def _cancelled_event(stage: str):
+        """在 VLM 或 CV 阶段边界退出，避免断连后继续消耗模型调用。"""
+        if not cancel.is_cancelled(run_id):
+            return None
+        trace.event(
+            "image_end", status="failed", fail_reason="cancelled", label=source_label,
+            duration_s=round(time.time() - t0, 1), cancelled_at=stage,
+        )
+        return {"type": "error", "run_id": run_id, "message": "分析已被用户停止。"}
+
+    if event := _cancelled_event("before_vlm_annotate"):
+        yield event
+        return
+
     # Step: VLM
     print(f"[Pipeline] Sending {image.shape[1]}x{image.shape[0]} to Doubao Vision...")
-    vlm_result = vlm_label_plants(image)
+    with trace.phase("vlm_annotate"):
+        vlm_result = vlm_label_plants(image)
+    model_calls = [vlm_result["model_call"]] if isinstance(vlm_result.get("model_call"), dict) else []
     plants = vlm_result.get("plants", []) or []
     crops = vlm_result.get("crops", {}) or {}
     raw_response = vlm_result.get("raw_response", "")
@@ -165,13 +183,16 @@ def analyze_plant_image_stream(
         "parsed_crop_count": len(crops),
         "parse_error": bool(vlm_result.get("parse_error")),
         "partial_json": bool(vlm_result.get("partial_json")),
+        "validation": vlm_result.get("validation", {}),
         "plants": plants,
         "ruler": vlm_result.get("ruler"),
         "label_tag": vlm_result.get("label_tag"),
         "sample_id": vlm_result.get("sample_id", ""),
         "raw_response_preview": raw_response[:1000],
     })
-    print(f"[Pipeline] VLM parsed plants={len(plants)}, crops={len(crops)}")
+    validation = vlm_result.get("validation", {})
+    print(f"[Pipeline] VLM validated plants={len(plants)}, crops={len(crops)}, "
+          f"rejected={len(validation.get('rejected', []))}, warnings={len(validation.get('warnings', []))}")
 
     labeled_img = vlm_result.get("labeled_image")
     if labeled_img is not None:
@@ -191,6 +212,11 @@ def analyze_plant_image_stream(
                 f"{debug_dir / 'vlm_label_raw.txt'}。"
             ),
             "result_dir": str(debug_dir),
+            "model_calls": model_calls,
+            "model_usage": {
+                "input_tokens": vlm_result.get("input_tokens"),
+                "output_tokens": vlm_result.get("output_tokens"),
+            },
         }
         return
 
@@ -203,6 +229,11 @@ def analyze_plant_image_stream(
                 f"调试文件已保存到 {debug_dir / 'vlm_label_debug.json'}。"
             ),
             "result_dir": str(debug_dir),
+            "model_calls": model_calls,
+            "model_usage": {
+                "input_tokens": vlm_result.get("input_tokens"),
+                "output_tokens": vlm_result.get("output_tokens"),
+            },
         }
         return
 
@@ -279,6 +310,10 @@ def analyze_plant_image_stream(
     verify_plants = [p for p in plants
                      if p.get("id") in crops and p.get("label", "") != "主干"]
 
+    if event := _cancelled_event("before_verify_crops"):
+        yield event
+        return
+
     if verify_plants:
         print(f"[Pipeline] Verifying {len(verify_plants)} crops in parallel...")
         with ThreadPoolExecutor(max_workers=len(verify_plants)) as executor:
@@ -303,6 +338,8 @@ def analyze_plant_image_stream(
                     print(f"[Pipeline] Verify #{pid} failed: {e}")
                     verdict = {"action": "keep", "reason": f"verify error: {e}"}
                 verify_results[pid] = verdict
+                if isinstance(verdict.get("model_call"), dict):
+                    model_calls.append(verdict["model_call"])
 
         # Process results in original order (for consistent step numbering)
         for p in verify_plants:
@@ -349,8 +386,35 @@ def analyze_plant_image_stream(
         for pid in plants_to_remove:
             crops.pop(pid, None)
 
-    # ── Cache verified crops (post-VLM-verification) ──
-    # Saves after keep/delete/recrop so downstream --cv-only runs use clean data.
+    # ── Optional adhesion detection per crop → mask foreign plant regions ──
+    if ENABLE_VLM_ADHESION_DETECTION:
+        for p in plants:
+            pid = p.get("id")
+            plabel = p.get("label", "")
+            if plabel == "主干" or pid not in crops:
+                continue
+            print(f"[Pipeline] Checking foreign adhesion on #{pid} {plabel}...")
+            adhesion_result = vlm_detect_adhesion(
+                crops[pid], plant_id=pid, label=plabel,
+                all_plants=plants, current_plant=p,
+            )
+            if isinstance(adhesion_result.get("model_call"), dict):
+                model_calls.append(adhesion_result["model_call"])
+            foreign_regions = adhesion_result.get("regions", [])
+            p["adhesion"] = {
+                "has_foreign": adhesion_result.get("has_foreign", False),
+                "region_count": len(foreign_regions),
+            }
+            if foreign_regions:
+                descs = "; ".join(region.get("description", "") for region in foreign_regions)
+                masked_crop, debug_crop = mask_adhesion_regions(crops[pid], foreign_regions)
+                yield _save_step(debug_crop, f"[#{pid} {plabel}] 异株检测：发现 {len(foreign_regions)} 个混入区域（红色）— {descs}")
+                yield _save_step(masked_crop, f"[#{pid} {plabel}] 异株遮涂：已涂黑 {len(foreign_regions)} 个区域")
+                crops[pid] = masked_crop
+            else:
+                yield _save_step(crops[pid], f"[#{pid} {plabel}] 异株检测：未发现其他植株混入")
+
+    # ── Cache verified crops after any optional masking ──
     try:
         _cache_dir = CACHE_DIR / (cache_key or stem_name)
         _cache_dir.mkdir(parents=True, exist_ok=True)
@@ -362,46 +426,17 @@ def analyze_plant_image_stream(
                 crop_fname = f"crop_{pid}_{label}.jpg"
                 cv2.imwrite(str(_cache_dir / crop_fname), crops[pid])
                 _crop_files[str(pid)] = crop_fname
-        _meta = {
-            "plants": plants,
-            "crop_files": _crop_files,
-            "raw_response": vlm_result.get("raw_response", ""),
-        }
+        _meta = {"plants": plants, "crop_files": _crop_files, "raw_response": vlm_result.get("raw_response", "")}
         with open(_cache_dir / "vlm_result.json", "w", encoding="utf-8") as _f:
             json.dump(_meta, _f, ensure_ascii=False, indent=2)
         print(f"[Cache] Saved {len(_crop_files)} verified crops to {_cache_dir}")
     except Exception as _e:
         print(f"[Cache] Warning: failed to save cache: {_e}")
 
-    # # Steps: Adhesion detection per crop → mask foreign plant regions
-    # (temporarily disabled — testing tight crop without padding first)
-    # for p in plants:
-    #     pid = p.get("id")
-    #     plabel = p.get("label", "")
-    #     if plabel == "主干" or pid not in crops:
-    #         continue
-    #     print(f"[Pipeline] Checking foreign adhesion on #{pid} {plabel}...")
-    #     adhesion_result = vlm_detect_adhesion(
-    #         crops[pid], plant_id=pid, label=plabel,
-    #         all_plants=plants, current_plant=p)
-    #     foreign_regions = adhesion_result.get("regions", [])
-    #     p["adhesion"] = {
-    #         "has_foreign": adhesion_result.get("has_foreign", False),
-    #         "region_count": len(foreign_regions),
-    #     }
-    #     if foreign_regions:
-    #         descs = "; ".join(r.get("description", "") for r in foreign_regions)
-    #         masked_crop, debug_crop = mask_adhesion_regions(crops[pid], foreign_regions)
-    #         yield _save_step(debug_crop,
-    #                          f"[#{pid} {plabel}] 异株检测：发现 {len(foreign_regions)} 个混入区域（红色）— {descs}")
-    #         yield _save_step(masked_crop,
-    #                          f"[#{pid} {plabel}] 异株遮涂：已涂黑 {len(foreign_regions)} 个区域")
-    #         crops[pid] = masked_crop  # use cleaned version for pod counting
-    #     else:
-    #         yield _save_step(crops[pid],
-    #                          f"[#{pid} {plabel}] 异株检测：未发现其他植株混入")
-
     # Steps: pod counting per branch (CPU, fast)
+    if event := _cancelled_event("before_cv_pod_count"):
+        yield event
+        return
     _counter = _stalk_counter
     pod_plants = [p for p in plants
                   if p.get("label", "") != "主干" and p.get("id") in crops]
@@ -446,6 +481,9 @@ def analyze_plant_image_stream(
             yield _save_step(step_img, f"[#{pid} {plabel}] {step_desc}")
 
     # ── VLM pod verification (parallel) ──
+    if event := _cancelled_event("before_vlm_pod_review"):
+        yield event
+        return
     vlm_verify_inputs = []
     for p in pod_plants:
         pid = p.get("id")
@@ -481,6 +519,8 @@ def analyze_plant_image_stream(
                 pid = p.get("id")
                 try:
                     vlm_verify_results[pid] = fut.result()
+                    if isinstance(vlm_verify_results[pid].get("model_call"), dict):
+                        model_calls.append(vlm_verify_results[pid]["model_call"])
                 except Exception as e:
                     print(f"[Pipeline] VLM verify #{pid} failed: {e}")
                     vlm_verify_results[pid] = {
@@ -589,6 +629,20 @@ def analyze_plant_image_stream(
     if trunk_pixel_len > 0 and px_per_cm and px_per_cm > 0:
         main_stem_length_cm = round(trunk_pixel_len / px_per_cm, 1)
 
+    input_tokens = sum(
+        call.get("input_tokens", 0) for call in model_calls
+        if isinstance(call.get("input_tokens"), int)
+    )
+    output_tokens = sum(
+        call.get("output_tokens", 0) for call in model_calls
+        if isinstance(call.get("output_tokens"), int)
+    )
+    trace.event(
+        "image_end", status="completed", label=source_label, duration_s=elapsed,
+        plants=len(plants), crops=len(crops), branch_count=branch_count,
+        total_pods=total_pods, ruler_found=ruler_found,
+        main_stem_length_cm=main_stem_length_cm,
+    )
     yield {
         "type": "result",
         "run_id": run_id,
@@ -610,6 +664,7 @@ def analyze_plant_image_stream(
         "px_per_cm": px_per_cm,
         "label_found": label_found,
         "label_is_flipped": label_is_flipped,
+        "label_validation": validation,
         "summary": {
             "branch_count": branch_count,
             "predicted_branch_count": branch_count,
@@ -625,6 +680,11 @@ def analyze_plant_image_stream(
             "label_found": label_found,
             "branch_pod_breakdown": branch_pod_breakdown,
         },
+        "model_usage": {
+            "input_tokens": input_tokens if model_calls else None,
+            "output_tokens": output_tokens if model_calls else None,
+        },
+        "model_calls": model_calls,
         "plants": plants,
         "processing_time_s": elapsed,
         "total_steps": step_counter[0],

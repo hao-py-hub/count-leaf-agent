@@ -1,163 +1,165 @@
-# 油菜考种工作台
+# 油菜表型分析 Agent 工作台
 
-油菜植株表型分析工具。用户在本机浏览器中上传照片，系统通过豆包视觉模型识别主干、主枝和分枝，再用果柄法统计角果数量，并展示标尺换算后的主干长度。
+面向油菜科研考种场景的本地受控视觉 Agent。系统以 **VLM 部件定位 + `stalk` 果柄法计数** 为唯一图像计数权威，在其外构建异步任务、人工复核、结果版本、项目隔离、知识检索、审计与外部 Agent 接入能力。
 
-当前部署形态是单用户本机 Docker 服务，默认访问地址为 `http://localhost:8501`。
+它不是通用聊天机器人，也不重新训练角果检测模型；它解决的是“将植株照片的自动分析结果安全地纳入科研工作流”的问题。
 
-## 功能
+## 项目能力
 
-- 单张图片上传并实时查看分析步骤。
-- 选择本地文件夹，将图片加入队列后逐张识别。
-- 通过数据目录选择 `online_uploads/` 中的图片。
-- SQLite 保存识别历史、原始结果和人工修订。
-- 修改植株数量、部件类型和角果数量。
-- 新增或删除主干、主枝、分枝，保存后自动重算分枝数和角果总数。
-- 恢复某条记录的原始识别结果。
-- 保存中间步骤图、VLM 原始响应和验证裁剪，便于复核。
+| 场景 | 提供能力 | 核心约束 |
+| --- | --- | --- |
+| 图像分析 | 单图/批量异步任务、SSE 进度、缓存、重试与安全取消 | 创建任务需要 `confirm: true` |
+| 结果解释 | Agent 根据真实分析结果解释质量发现 | LLM 不得估算或补写角果数量 |
+| 人工复核 | 自动/手动复核、结案、驳回、结果版本链 | 人工修改不覆盖自动版本 |
+| 科研数据 | 项目内历史统计、导出、报告、指标 | 导出和报告需要确认 |
+| 知识问答 | SQLite FTS5 RAG、SOP/拍摄规范/口径检索 | 回答附来源，无依据则明确说明 |
+| 外部接入 | Function Calling 与 MCP `stdio` 六项只读工具 | 不提供 Shell、SQL、任意路径或写工具 |
 
-> 当前编辑器修改的是现有算法的 `pod_count`，界面显示为“角果数量”。如果业务中的“叶子数量”指叶片而不是角果，需要另行增加叶片识别指标；本版本不会把角果数量冒充叶片数量。
-
-## 处理流程
+## 总体架构
 
 ```text
-上传图片
-  → 豆包视觉模型识别主干/主枝/分枝、标尺和标签
-  → VLM 复核裁剪范围
-  → 果柄法进行二值化、骨架化和拓扑计数
-  → VLM 复核枯枝误报与被过滤的候选
-  → 返回步骤图、部件明细、角果汇总和主干长度
+┌──────────────────────────────── 使用层 ───────────────────────────────┐
+│ 浏览器工作台（原生 HTML/JS） │ 外部企业 Agent / Function Calling / MCP │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │ HTTPS / SSE / stdio
+┌───────────────────────────────▼───────────────────────────────────────┐
+│ FastAPI API（app/api/v2）                                              │
+│ 资产 │ 任务/批次 │ 复核 │ 报告 │ 历史/导出 │ 知识库 │ 审计/指标         │
+└──────────────┬───────────────────────────────┬────────────────────────┘
+               │                               │
+┌──────────────▼───────────────┐  ┌────────────▼────────────────────────┐
+│ Agent（app/agent）            │  │ 领域服务（app/services）             │
+│ LangGraph 固定路由            │  │ 任务、缓存、复核、RAG、报告、策略     │
+│ SkillRegistry + ToolPolicy    │  │ 版本、审计、事件、项目范围            │
+└──────────────┬───────────────┘  └────────────┬────────────────────────┘
+               │                               │
+┌──────────────▼───────────────────────────────▼────────────────────────┐
+│ SQLite / 本地受控目录 / in_process Worker（可选 Celery）               │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼───────────────────────────────────────┐
+│ 算法流水线（app/pipeline）                                             │
+│ VLM 定位主干/主枝/分枝 → 裁剪复核 → stalk 果柄法计数 → 候选复核         │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-## Docker 启动
+### 前端、后端与 Agent 的分工
 
-### 1. 准备配置
+| 层 | 负责内容 | 明确不负责 |
+| --- | --- | --- |
+| 前端 | 上传、项目选择、显式确认、任务进度、结果和复核展示 | 保存密钥、直接改库、自行算计数 |
+| API | Schema、确认门禁、归属校验、SSE、错误响应 | 同步阻塞执行图像流水线 |
+| Agent | 意图路由、受限工具编排、结果解释、RAG 引用 | 文件系统、SQL、Shell、编造数值 |
+| 领域服务 | 幂等、缓存、状态机、版本、预算、审计、项目隔离 | 依赖前端或 LangGraph |
+| 算法 | 已授权图片的 VLM + CV 分析与步骤产物 | 会话、项目 UI 或 Agent 权限 |
 
-```bash
-cp .env.example .env
+## 数据流
+
+### 分析、复核与报告
+
+```text
+图片 → 资产上传（asset_id + project_id）
+     → confirm=true 创建 AnalysisJob（queued）
+     → Worker：VLM 定位 → CV 计数 → 质量检查
+     → 自动 ResultVersion + 步骤图 + provenance + 审计/领域事件
+     ├─ completed：项目内读取、统计、报告
+     └─ review_required：ReviewCase → 人工结案 → 新的人工 ResultVersion
 ```
 
-编辑 `.env`，至少填写：
+每个关键对象关联 `project_id` 与 `trace_id`。缓存只复用已完成且未撤销的自动结果；重试创建新任务并用 `retry_of` 关联父任务。
+
+### 对话、RAG 与审计
+
+```text
+用户问题 + project_id + trace_id
+  → Agent supervisor 固定路由
+  → knowledge：FTS5 检索 + 来源；或业务 ToolPolicy 校验 + 领域服务
+  → 脱敏会话、工具调用、模型账本、领域事件
+  → /api/v2/agent/traces/{trace_id} 按项目回放
+```
+
+## 安全与项目隔离
+
+- `project_id` 覆盖资产、任务、批次、复核、报告、历史、知识库、会话、trace、审计和兼容接口；错误项目返回 `404`。
+- 所有写操作都需要 `confirm: true`；未确认请求不会创建任务、修改数据或消耗模型预算。
+- 审计只保存参数哈希、状态、结果引用、耗时、版本和追踪标识，不保存 API Key、原始问题或原图绝对路径。
+- MCP 仅开放 `get_analysis_result`、`quality_check`、`search_history`、`aggregate_metrics`、`get_review`、`retrieve_knowledge` 六项只读工具；Function Calling 额外提供 `get_analysis_evidence`，聚合真实结果、版本与复核反馈。
+
+## 技术栈
+
+| 模块 | 当前方案 |
+| --- | --- |
+| 前后端 | FastAPI、原生 HTML/JS、SSE |
+| Agent | LangGraph 固定状态图、SkillRegistry、ToolPolicy、Pydantic Schema |
+| 算法 | 豆包视觉模型兼容接口、OpenCV、scikit-image、`stalk` 果柄法 |
+| 存储与任务 | SQLite/SQLAlchemy、本地文件目录、默认进程内 Worker、可选 Celery |
+| RAG 与观测 | SQLite FTS5 `keyword`/`hybrid`、审计账本、token/成本/缓存/复核指标 |
+
+## 启动
+
+### 1. 配置 `.env`
+
+从 `.env.example` 复制，并至少配置：
 
 ```dotenv
 ARK_API_KEY=你的豆包 Ark API Key
 ARK_API_BASE=https://ark.cn-beijing.volces.com/api/v3
 VLM_MODEL=你的视觉模型 Endpoint
+ANALYSIS_ALGORITHM_VERSION=stalk-v0.1
+ANALYSIS_PROMPT_VERSION=phenotype-prompt-v1
+STALK_TWIG_WIDTH_RATIO=0.70
+STALK_TWIG_AREA_RATIO=0.25
 ```
 
-### 2. 启动服务
+`STALK_TWIG_*` 是果柄法枯枝过滤阈值，取值范围 `(0, 1]`，并会进入缓存键。
 
-```bash
+### 2. Docker
+
+```powershell
+Set-Location "D:\CDriveMigration\PycharmProjects\count-beaf-agent"
 docker compose up -d --build
 ```
 
-打开 `http://localhost:8501`。
+打开 `http://localhost:8501`。宿主机保留 `data/`、`uploads/`、`results/`、`online_uploads/`、`benchmark_cache/`。
 
-查看日志和状态：
-
-```bash
-docker compose logs -f cv-agent
-docker compose ps
-```
-
-停止服务：
-
-```bash
-docker compose down
-```
-
-### 3. 持久化目录
-
-`docker-compose.yml` 将以下目录挂载到宿主机项目目录：
-
-| 目录 | 内容 |
-| --- | --- |
-| `data/` | SQLite 历史库 `history.sqlite3` |
-| `uploads/` | 用户上传的原图 |
-| `results/` | 每次运行的步骤图、调试文件和 `result.json` |
-| `online_uploads/` | 可从数据目录入口选择的图片 |
-| `benchmark_cache/` | 已验证裁剪和 VLM 元数据缓存 |
-
-这些目录不会被提交到 Git。重建镜像不会删除宿主机中的历史记录和结果文件。
-
-## 本地开发启动
-
-Python 3.11 或更高版本：
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python -m app.main
-```
-
-Windows PowerShell：
+### 3. 本地开发
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m app.main
+Set-Location "D:\CDriveMigration\PycharmProjects\count-beaf-agent"
+& ".\.venv312\Scripts\python.exe" -m app.main
 ```
 
-## API
+## 接口地图
 
-分析接口返回 `text/event-stream`，每行格式为 `data: {JSON}`。
+| 分类 | 主要路径 |
+| --- | --- |
+| 健康/能力 | `GET /api/health`、`/api/ready`、`/api/v2/agent/runtime`、`/skills` |
+| 资产/任务 | `/api/v2/assets/upload`、`/api/v2/jobs`、`/api/v2/batches` |
+| 复核/报告 | `/api/v2/reviews`、`/api/v2/agent/jobs/{id}/report`、`/api/v2/agent/reports/{id}` |
+| 知识/历史 | `/api/v2/knowledge`、`/api/v2/exports/history`、`/api/v2/history` |
+| Agent/审计 | `/api/v2/agent/chat`、`/jobs/{id}/evidence`、`/traces/{trace_id}`、`/audit`、`/metrics` |
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/analyze` | 上传一张图片并启动分析 |
-| `POST` | `/api/analyze_online` | 分析 `online_uploads/` 下的相对路径 |
-| `GET` | `/api/online_images` | 列出数据目录中的图片 |
-| `GET` | `/api/history` | 查询历史记录，支持 `limit`、`offset`、`q` |
-| `GET` | `/api/history/{run_id}` | 获取历史详情、当前结果和步骤元数据 |
-| `PUT` | `/api/history/{run_id}` | 保存人工修改后的部件和数量 |
-| `POST` | `/api/history/{run_id}/restore` | 恢复原始识别结果 |
-| `GET` | `/api/results/{run_id}` | 获取当前持久化结果 |
-| `GET` | `/api/health` | 服务健康检查 |
+涉及数据的请求应携带 `project_id`；创建、结案和导出还需 `confirm: true`。
 
-上传示例：
+## 测试、评测与边界
 
-```bash
-curl -N -X POST http://localhost:8501/api/analyze \
-  -F "file=@plant_photo.jpg"
+运行全量测试：
+
+```powershell
+Set-Location "D:\CDriveMigration\PycharmProjects\count-beaf-agent"
+& ".\.venv312\Scripts\python.exe" -m unittest discover -s tests -p "test_*.py"
 ```
 
-最终 `result` 事件包含：
-
-- `run_id`：运行标识。
-- `plants`：部件明细，每项包含 `id`、`label`、`pod_count`。
-- `branch_count`：分枝数量。
-- `main_inflorescence_pod_count`：主枝角果数量。
-- `branch_pod_count`：分枝角果数量。
-- `total_pods`：角果总数。
-- `main_stem_length_cm`：检测到标尺时的主干长度。
-- `result_dir`：步骤图和调试文件目录。
-
-当前只支持 `stalk` 果柄法；其他旧版 `skeleton`、`graph`、`plantcv` 方法已移除。
-
-## 输入照片要求
-
-- 使用黑色背景布。
-- 左侧放置已知长度的黄色标尺。
-- 植株尽量平铺展开，减少分枝重叠。
-- 俯拍并保持光线均匀。
-- 保证主干、主枝和分枝末端都在照片内。
-
-## 测试与验证
-
-运行后端和 API 测试：
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-验证 Docker 配置：
-
-```bash
-docker compose config --quiet
-```
+- 本地全量 `unittest` 回归 **297 项通过**；覆盖任务、缓存、复核、Agent、RAG、MCP、事件、证据包与项目隔离。
+- Agent 黄金集 9/9 通过，仅说明受控路由、工具选择与引用覆盖，不代表图像计数精度。
+- 当前没有可公开宣称的整株角果计数准确率。DeepCanola BR017 是独立角果图，缺少整株主干/分枝结构，不能用于本项目整株流水线精度结论。
+- 本期为单机单用户 MVP；OIDC/RBAC、真实多租户、对象存储、PostgreSQL、生产 Redis/Celery 集群、远程 MCP 网关、Embedding/向量数据库不在本期范围。
 
 ## 相关文档
 
-- [DOCKER.md](DOCKER.md)：镜像构建、迁移和挂载目录说明。
-- [DEVELOPMENT.md](DEVELOPMENT.md)：历史开发记录，部分内容保留为背景资料；当前行为以本 README 和代码为准。
+- [PRD-second-project.md](PRD-second-project.md)：产品定位与验收指标。
+- [TDD-second-project-v0.3.md](TDD-second-project-v0.3.md)：领域模型、策略、事件与隔离设计。
+- [agent.md](agent.md)：Agent、工具、RAG、MCP 与代码规范。
+- [PROJECT_STATUS.md](PROJECT_STATUS.md)：实施阶段、测试证据和已知边界。
+- [docs/DEMO.md](docs/DEMO.md)：演示路径。
+- [DOCKER.md](DOCKER.md)：容器运行与迁移说明。

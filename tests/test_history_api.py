@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import app.main as main_module
 from app.history import HistoryStore
@@ -75,6 +77,44 @@ class HistoryApiTests(unittest.TestCase):
         self.assertEqual(restore.status_code, 200)
         self.assertEqual(restore.json()["result"]["total_pods"], 5)
 
+    def test_result_endpoint_rejects_path_traversal_when_history_is_missing(self):
+        outside = self.root / "outside-result.json"
+        outside.write_text('{"secret":"not a result"}', encoding="utf-8")
+        response = self.client.get("/api/results/..%2Foutside-result.json")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("secret", response.text)
+
+    def test_history_and_result_responses_hide_local_paths(self):
+        main_module.history_store.start("private-path-run", "sample.jpg", "C:/private/uploads/sample.jpg")
+        main_module.history_store.complete(
+            "private-path-run",
+            {"type": "result", "run_id": "private-path-run", "source_image": "C:/private/uploads/sample.jpg", "result_dir": "C:/private/results/private-path-run", "plants": [], "summary": {}},
+            [],
+        )
+        history = self.client.get("/api/history/private-path-run")
+        result = self.client.get("/api/results/private-path-run")
+        self.assertEqual(history.status_code, 200)
+        self.assertNotIn("C:/private", history.text)
+        self.assertNotIn("source_image", result.json())
+        self.assertNotIn("result_dir", result.json())
+
+    def test_history_list_accepts_project_scope(self):
+        main_module.history_store.start(
+            "other-project-run", "other.jpg", "uploads/other.jpg", project_id="other-project"
+        )
+        main_module.history_store.complete(
+            "other-project-run",
+            {"type": "result", "run_id": "other-project-run", "plants": [], "summary": {}},
+            [],
+        )
+
+        default_response = self.client.get("/api/history")
+        other_response = self.client.get("/api/history?project_id=other-project")
+
+        self.assertEqual(default_response.json()["count"], 1)
+        self.assertEqual(other_response.json()["count"], 1)
+        self.assertEqual(other_response.json()["items"][0]["run_id"], "other-project-run")
+
     def test_analyze_stream_persists_completed_history(self):
         def fake_analyzer(image_path, **kwargs):
             run_id = kwargs["run_id"]
@@ -98,9 +138,11 @@ class HistoryApiTests(unittest.TestCase):
             }
 
         main_module.analyze_plant_image_stream = fake_analyzer
+        image_buffer = BytesIO()
+        Image.new("RGB", (2, 2), "black").save(image_buffer, format="JPEG")
         response = self.client.post(
             "/api/analyze",
-            files={"file": ("producer.jpg", b"not-a-real-image", "image/jpeg")},
+            files={"file": ("producer.jpg", image_buffer.getvalue(), "image/jpeg")},
         )
 
         self.assertEqual(response.status_code, 200)

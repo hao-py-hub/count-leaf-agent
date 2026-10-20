@@ -1,0 +1,25 @@
+{
+  "dataset_name": "rapeseed-rag-evaluation-v0.1",
+  "dataset_version": "0.1",
+  "scope": "本机油菜考种知识库",
+  "cases": [
+    {
+      "id": "capture-background-001",
+      "question": "拍摄角果图片时背景应该怎么准备？",
+      "expected_document_title": "拍摄与上传规范",
+      "expected_evidence_terms": ["黑色背景", "平铺"],
+      "category": "capture_sop",
+      "expected_answerable": true,
+      "notes": "同义表达测试：背景布、黑底。"
+    },
+    {
+      "id": "unsupported-001",
+      "question": "请根据知识库推荐下季度的施肥配方。",
+      "expected_document_title": null,
+      "expected_evidence_terms": [],
+      "category": "out_of_scope",
+      "expected_answerable": false,
+      "notes": "无依据时应明确说明知识库未检索到资料。"
+    }
+  ]
+}

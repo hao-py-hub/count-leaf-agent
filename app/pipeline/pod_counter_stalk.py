@@ -17,9 +17,12 @@ Filtering rule:
   adaptive width/area twig filtering. Very short noise is still removed first.
 """
 
+from collections import deque
+
 import cv2
 import numpy as np
-from collections import deque
+
+from app.config import STALK_TWIG_AREA_RATIO, STALK_TWIG_WIDTH_RATIO
 
 from .pod_counter_common import (
     _binarize,
@@ -667,8 +670,8 @@ def count_pods_on_branch(
         branch_data.append((tip, full_path, found_attach, area, avg_w, crossing_related))
 
     # Filter: dead twigs (width/area) + noise (short complete branches)
-    WIDTH_RATIO = 0.70
-    AREA_RATIO = 0.25
+    width_ratio = STALK_TWIG_WIDTH_RATIO
+    area_ratio = STALK_TWIG_AREA_RATIO
     MIN_BRANCHES = 4
     MIN_BRANCH_LEN = 10  # denoising: complete branches shorter than this are noise
     rejected_pixels = set()
@@ -695,8 +698,8 @@ def count_pods_on_branch(
 
     # Step B: adaptive width/area filtering for dead twigs
     if remaining and len(remaining) >= MIN_BRANCHES:
-        area_fence = median_area * AREA_RATIO
-        width_fence = median_width * WIDTH_RATIO
+        area_fence = median_area * area_ratio
+        width_fence = median_width * width_ratio
 
         for item in remaining:
             area_val = item[3]
